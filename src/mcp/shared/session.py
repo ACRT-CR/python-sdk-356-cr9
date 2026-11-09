@@ -41,6 +41,8 @@ ReceiveNotificationT = TypeVar(
 
 RequestId = str | int
 
+CONNECTION_CLOSED = -32000
+
 
 class RequestResponder(Generic[ReceiveRequestT, SendResultT]):
     """Handles responding to MCP requests and manages request lifecycle.
@@ -325,64 +327,87 @@ class BaseSession(
             self._read_stream,
             self._write_stream,
         ):
-            async for message in self._read_stream:
-                if isinstance(message, Exception):
-                    await self._handle_incoming(message)
-                elif isinstance(message.message.root, JSONRPCRequest):
-                    validated_request = self._receive_request_type.model_validate(
-                        message.message.root.model_dump(
-                            by_alias=True, mode="json", exclude_none=True
-                        )
-                    )
-
-                    responder = RequestResponder(
-                        request_id=message.message.root.id,
-                        request_meta=validated_request.root.params.meta
-                        if validated_request.root.params
-                        else None,
-                        request=validated_request,
-                        session=self,
-                        on_complete=lambda r: self._in_flight.pop(r.request_id, None),
-                    )
-
-                    self._in_flight[responder.request_id] = responder
-                    await self._received_request(responder)
-
-                    if not responder._completed:  # type: ignore[reportPrivateUsage]
-                        await self._handle_incoming(responder)
-
-                elif isinstance(message.message.root, JSONRPCNotification):
-                    try:
-                        notification = self._receive_notification_type.model_validate(
+            try:
+                async for message in self._read_stream:
+                    if isinstance(message, Exception):
+                        await self._handle_incoming(message)
+                    elif isinstance(message.message.root, JSONRPCRequest):
+                        validated_request = self._receive_request_type.model_validate(
                             message.message.root.model_dump(
                                 by_alias=True, mode="json", exclude_none=True
                             )
                         )
-                        # Handle cancellation notifications
-                        if isinstance(notification.root, CancelledNotification):
-                            cancelled_id = notification.root.params.requestId
-                            if cancelled_id in self._in_flight:
-                                await self._in_flight[cancelled_id].cancel()
-                        else:
-                            await self._received_notification(notification)
-                            await self._handle_incoming(notification)
-                    except Exception as e:
-                        # For other validation errors, log and continue
-                        logging.warning(
-                            f"Failed to validate notification: {e}. "
-                            f"Message was: {message.message.root}"
+
+                        responder = RequestResponder(
+                            request_id=message.message.root.id,
+                            request_meta=validated_request.root.params.meta
+                            if validated_request.root.params
+                            else None,
+                            request=validated_request,
+                            session=self,
+                            on_complete=lambda r: self._in_flight.pop(r.request_id, None),
                         )
-                else:  # Response or error
-                    stream = self._response_streams.pop(message.message.root.id, None)
-                    if stream:
-                        await stream.send(message.message.root)
-                    else:
-                        await self._handle_incoming(
-                            RuntimeError(
-                                "Received response with an unknown "
-                                f"request ID: {message}"
+
+                        self._in_flight[responder.request_id] = responder
+                        await self._received_request(responder)
+
+                        if not responder._completed:  # type: ignore[reportPrivateUsage]
+                            await self._handle_incoming(responder)
+
+                    elif isinstance(message.message.root, JSONRPCNotification):
+                        try:
+                            notification = self._receive_notification_type.model_validate(
+                                message.message.root.model_dump(
+                                    by_alias=True, mode="json", exclude_none=True
+                                )
                             )
-                        )
+                            # Handle cancellation notifications
+                            if isinstance(notification.root, CancelledNotification):
+                                cancelled_id = notification.root.params.requestId
+                                if cancelled_id in self._in_flight:
+                                    await self._in_flight[cancelled_id].cancel()
+                            else:
+                                await self._received_notification(notification)
+                                await self._handle_incoming(notification)
+                        except Exception as e:
+                            # For other validation errors, log and continue
+                            logging.warning(
+                                f"Failed to validate notification: {e}. "
+                                f"Message was: {message.message.root}"
+                            )
+                    else:  # Response or error
+                        stream = self._response_streams.pop(message.message.root.id, None)
+                        if stream:
+                            await stream.send(message.message.root)
+                        else:
+                            await self._handle_incoming(
+                                RuntimeError(
+                                    "Received response with an unknown "
+                                    f"request ID: {message}"
+                                )
+                            )
+
+            except anyio.ClosedResourceError:
+                # This is expected when the client disconnects abruptly.
+                # Without this handler, the exception would propagate up and
+                # crash the server's task group.
+                logging.debug("Read stream closed by client")
+            except Exception as e:
+                # Other exceptions are not expected and should be logged. We purposefully
+                # catch all exceptions here to avoid crashing the server.
+                logging.exception(f"Unhandled exception in receive loop: {e}")
+            finally:
+                # after the read stream is closed, we need to send errors
+                # to any pending requests
+                for id, stream in list(self._response_streams.items()):
+                    error = ErrorData(code=CONNECTION_CLOSED, message="Connection closed")
+                    try:
+                        await stream.send(JSONRPCError(jsonrpc="2.0", id=id, error=error))
+                        await stream.aclose()
+                    except Exception:
+                        # Stream might already be closed
+                        pass
+                self._response_streams.clear()
 
     async def _received_request(
         self, responder: RequestResponder[ReceiveRequestT, SendResultT]
